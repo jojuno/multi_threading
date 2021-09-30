@@ -26,6 +26,7 @@ typedef struct packet {
     long int q2EnteredUsec;
     long int ogCreatedSec;
     long int ogCreatedUsec;
+    double timeInSystem;
     int id;
 } Packet;
 
@@ -61,7 +62,18 @@ int tokens_total = 0;
 int n = 1;
 struct timeval current_time;
 int packets = 0;
-int numProcessed = 0;
+int numArrived = 0;
+double interArrivalTimeTotal = 0;
+double serviceTimeTotal = 0;
+double q1TimeTotal = 0;
+double q2TimeTotal = 0;
+double s1TimeTotal = 0;
+double s2TimeTotal = 0;
+double totalPacketTime = 0;
+double timeSpentInSystem = 0;
+double totalEmulationTime = 0; //ms
+
+
 
 void *PacketThread(void *);
 void *TokenThread(void *);
@@ -195,9 +207,55 @@ int main(int argc, char *argv[])
     pthread_join(serverThread1, 0);
     pthread_join(serverThread2, 0);
 
-    printf("statistics: <here>\n");
+    //token arrival time
+    struct timeval emulation_finished_time, emulation_finished_time_difference;
+    gettimeofday(&emulation_finished_time, NULL);
+
+    TimePassed emulation_finished_time_passed = GetTimePassed2(emulation_finished_time, current_time);
+    printf(
+        "%08ld.%03ldms: emulation ends\n", 
+        emulation_finished_time_passed.timeSec, 
+        emulation_finished_time_passed.timeUsec
+    );
+    timersub(&emulation_finished_time, &current_time, &emulation_finished_time_difference);
+    totalEmulationTime = emulation_finished_time_difference.tv_sec * 1000 + (double) emulation_finished_time_difference.tv_usec / 1000;
+
+    PrintStats();
 
     return(0);
+}
+
+void PrintStats(){
+    //add them
+    //divide by the number of packets
+    //in seconds
+    //6 digits of precision
+    printf("\n");
+    printf("Statistics:\n");
+    printf("\n");
+
+    printf("    average packet inter-arrival time = %.5f\n", interArrivalTimeTotal / packets / 1000);
+    printf("    average packet service time = %.5f\n", serviceTimeTotal / packets / 1000);
+    printf("\n");
+    //divide number into whole number and decimal number
+    printf("    average number of packets in Q1 = %.5f\n", q1TimeTotal / (double) totalEmulationTime);
+    printf("    average number of packets in Q2 = %.6g\n", (double) q2TimeTotal / (double) totalEmulationTime);
+    printf("    average number of packets at S1 = %.6g\n", s1TimeTotal / totalEmulationTime);
+    printf("    average number of packets at S2 = %.6g\n", s2TimeTotal / totalEmulationTime);
+    printf("\n");
+    printf("    average time a packet spent in system = %.6g\n", (double) totalPacketTime / 1000000 / (double) packets);
+    //printf("    standard deviation for time spent in system = %.6g\n", 0);
+    printf("    standard deviation for time spent in system = 0\n");
+    printf("\n");
+    //printf("token drop probability = %.6g\n", 0);
+    printf("token drop probability = 0\n");
+    //printf("packet drop probability = %.6g\n", 0);
+    printf("packet drop probability = 0\n");
+    /*
+
+    
+
+    */
 }
 
 Packet *NewPacket(int tokensNeeded, double serviceTime, long int createdSec, long int createdMs, long int ogCreatedSec, long int ogCreatedUsec, int id) {
@@ -247,7 +305,7 @@ void *PacketThread(void *arg) {
     pthread_mutex_lock(&mutex);
 
     printf(
-        "%08ld.%03ldms: p%d arrives, needs %d tokens, inter-arrival time: %08ld.%03ldms\n", 
+        "%08ld.%03ldms: p%d arrives, needs %d tokens, inter-arrival time: %ld.%03ldms\n", 
         time_difference_long_int, 
         time_difference_left_over_long_int, 
         packet -> id, 
@@ -255,6 +313,7 @@ void *PacketThread(void *arg) {
         time_difference_long_int, 
         time_difference_left_over_long_int
     );
+    interArrivalTimeTotal += time_difference_combined;
 
     if (tokens < P) {
         My402ListAppend(&q1, packet);
@@ -299,7 +358,7 @@ void *PacketThread(void *arg) {
 //transmit the packet into the server
 void *TokenThread(void *arg) {
     //infinite loop
-    for(;;) {
+    while (tokens_total != P) {
         usleep(1/r * 1000000);
         
         //find out when the token was generated
@@ -348,7 +407,6 @@ void *TokenThread(void *arg) {
             if (&firstElem != NULL) {}
             Packet *packet = firstElem -> obj;
             if (packet -> tokensNeeded <= tokens) {
-                //00002128.261ms: p1 leaves Q1, time in Q1 = 1082.232ms, token bucket now has 0 token
                 My402ListUnlink(&q1, firstElem);
                 tokens = 0;
 
@@ -372,7 +430,7 @@ void *TokenThread(void *arg) {
                 }
 
                 printf(
-                    "%08ld.%03ldms: p%d leaves Q1, time in Q1 = %08ld.%03ldms, token bucket now has %d token\n", 
+                    "%08ld.%03ldms: p%d leaves Q1, time in Q1 = %ld.%03ldms, token bucket now has %d token\n", 
                     time_difference_long_int, 
                     time_difference_left_over_long_int, 
                     packet -> id,
@@ -380,6 +438,8 @@ void *TokenThread(void *arg) {
                     time_difference_packet_left_over_long_int,
                     tokens
                 );
+
+                q1TimeTotal += (double) (time_difference_packet_long_int + (double) time_difference_packet_left_over_long_int / 1000);
 
                 My402ListAppend(&q2, packet);
 
@@ -402,20 +462,19 @@ void *TokenThread(void *arg) {
 
             }
         }
-
-        //00004992.989ms: emulation ends
-
-
-
         pthread_mutex_unlock(&mutex);
-        
+
     }
-    pthread_exit((void *)1);
+    return 0;
     
 }
 
 int TimeToQuit() {
-    return FALSE;
+    if (numArrived == numToArrive) {
+        return TRUE;
+    } else {
+        return FALSE;
+    }
 }
 
 void *ServerThread(void *arg) {
@@ -423,11 +482,13 @@ void *ServerThread(void *arg) {
         pthread_mutex_lock(&mutex);
         //time_to_quit
         
-        while (My402ListLength(&q2) == 0 && !TimeToQuit()) {
+        while (My402ListLength(&q2) == 0 && numArrived != numToArrive) {
             pthread_cond_wait(&cv, &mutex);
         }
 
-        if (packets == numToArrive && My402ListEmpty(&q1) && My402ListEmpty(&q2)) {
+        if (numArrived == numToArrive && My402ListEmpty(&q1) && My402ListEmpty(&q2)) {
+            //must unlock so the other thread can continue
+            pthread_mutex_unlock(&mutex);
             pthread_cond_broadcast(&cv);
             return(0);
         } else {
@@ -449,13 +510,14 @@ void *ServerThread(void *arg) {
             }
 
             printf(
-                "%08ld.%03ldms: p%d leaves Q2, time in Q2 = %08ld.%03ldms\n", 
+                "%08ld.%03ldms: p%d leaves Q2, time in Q2 = %ld.%03ldms\n", 
                 t.timeSec, 
                 t.timeUsec, 
                 packet -> id,
                 time_difference_packet_long_int,
                 time_difference_packet_left_over_long_int
             );
+            q2TimeTotal += ((double) (time_difference_packet_long_int + (double) time_difference_packet_left_over_long_int / 1000));
 
             struct timeval packet_time, time_difference;
             gettimeofday(&packet_time, NULL);
@@ -476,10 +538,10 @@ void *ServerThread(void *arg) {
                 (long int) packet->serviceTime //double
             );
             
-            pthread_mutex_unlock(&mutex);
-            usleep(packet -> serviceTime);
+            
+            //usleep(packet -> serviceTime);
 
-            numProcessed++;
+            numArrived++;
 
             //TimePassed t2 = GetTimePassed();
 
@@ -517,6 +579,10 @@ void *ServerThread(void *arg) {
                 system_time_left_over_long_int = 1000 + system_time_left_over_long_int;
             }
 
+
+            totalPacketTime += (double) system_time_long_int * 1000 + (double) system_time_left_over_long_int / 1000;
+            printf("total packet time in server: %f\n", totalPacketTime);
+
             printf(
                 "%08ld.%03ldms: p%d departs from S%d, service time = %ld.%03ldms, time in system = %ld.%03ldms\n", 
                 total_time_difference_long_int, 
@@ -528,6 +594,18 @@ void *ServerThread(void *arg) {
                 system_time_long_int,
                 system_time_left_over_long_int
             );
+            //total service time
+            serviceTimeTotal += packet_service_time_combined;
+            //service time by thread
+            if (arg == 1) {
+                s1TimeTotal += (double) packet_service_time_combined;
+                printf("s1 time total in server thread: %f\n", s1TimeTotal);
+            } else {
+                s2TimeTotal += (double) packet_service_time_combined;
+            }
+            
+
+            pthread_mutex_unlock(&mutex);
         }
     }
     return (0);
