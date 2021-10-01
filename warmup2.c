@@ -5,27 +5,30 @@
  */
 
 #include <stdio.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <sys/time.h>
 #include <unistd.h>
 #include <stdbool.h>
 //must include file after putting it in 'make'
 #include <pthread.h>
+#include <math.h>
 
 #include "cs402.h"
 
 #include "my402list.h"
 
+//#define SIGINT 2
 
 typedef struct packet {
     int tokensNeeded;
     double serviceTime;
-    long int createdSec;
-    long int createdMs;
+    int interArrivalTime;
     long int q2EnteredSec;
     long int q2EnteredUsec;
-    long int ogCreatedSec;
-    long int ogCreatedUsec;
+    struct timeval creationTime;
+    struct timeval q1Entered;
+    struct timeval serviceStartTime;
     double timeInSystem;
     int id;
 } Packet;
@@ -44,24 +47,38 @@ void Usage()
     exit(-1);
 }
 
+int n = 20;
 int number = 0;
 char* token_bucket[100];
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
 My402List q1;
 My402List q2;
-/* global vars for testing */
-int numToArrive = 1;
-int lambda = 1;
+
+int numToArrive = 3;
+double lambda = 1;
+//int interArrivalTime = 0; //ms
+int serviceTime = 0; //ms
 double mu = 0.35;
 double r = 1.5;
 int B = 10;
 int P = 3;
-int tokens = 0;
-int tokens_total = 0;
-int n = 1;
-struct timeval current_time;
-int packets = 0;
+int tokensNeeded = 0; //num tokens required
+int tokensInBucket = 0;
+int tokensTotal = 0;
+int packetsSentToServers = 0;
+int packetsProcessedByServers = 0;
+int tokensLost = 0;
+int packetsSentFromQ1 = 0;
+int packetsSentToQ2 = 0;
+double avgSystemDuration = 0;
+double avgSystemDurationSquared = 0;
+int packetsLost = 0;
+//packets total, packets that passed, packets dropped
+
+struct timeval emulation_start_time;
+int packetsTotal = 0;
+int numPacketsExpected = 0;
 int numArrived = 0;
 double interArrivalTimeTotal = 0;
 double serviceTimeTotal = 0;
@@ -72,12 +89,19 @@ double s2TimeTotal = 0;
 double totalPacketTime = 0;
 double timeSpentInSystem = 0;
 double totalEmulationTime = 0; //ms
+struct timeval lastPacketArrivedTime;
+FILE *fp;
+int traceDrivenMode = FALSE;
+sigset_t set;
+
+int sigIntPressed = 0;
 
 
 
 void *PacketThread(void *);
 void *TokenThread(void *);
 void *ServerThread(void *);
+void *SigIntThread(void *);
 
 /* ----------------------- main() ----------------------- */
 
@@ -132,7 +156,7 @@ int GetNumLines(char *field, int field_sz) {
 TimePassed GetTimePassed() {
     struct timeval creation_time, time_difference;
     gettimeofday(&creation_time, NULL);
-    timersub(&creation_time, &current_time, &time_difference);
+    timersub(&creation_time, &emulation_start_time, &time_difference);
 
     //format time
     double time_difference_combined = time_difference.tv_sec * 1000 + (double) time_difference.tv_usec / 1000;
@@ -160,8 +184,6 @@ TimePassed GetTimePassed2(struct timeval t1, struct timeval t2) {
     double time_difference_left_over = time_difference_combined - time_difference_long_int;
     long int time_difference_left_over_long_int = time_difference_left_over * 1000;
 
-    //prints '000' for the decimals
-
     TimePassed t;
     t.timeSec = time_difference_long_int;
     t.timeUsec = time_difference_left_over_long_int;
@@ -172,14 +194,84 @@ TimePassed GetTimePassed2(struct timeval t1, struct timeval t2) {
 
 int main(int argc, char *argv[])
 {
-    
+    char bucketArg[3] = "-B";
+    char textFileArg[3] = "-t";
+    char rateOfTokensArg[3] = "-r";
+    char numPacketsArg[3] = "-n";
+    char numTokensPerPacketArg[3] = "-P";
+    char lambdaArg[8] = "-lambda";
+    char muArg[4] = "-mu";
+    char textFileName[50];
+    char *rateOfTokensPtr;
+    char *lambdaPtr;
+    char *muPtr;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], textFileArg) == 0) {
+            if (argv[i+1][0] != '-') {
+                strncpy(textFileName, argv[i+1], sizeof(textFileName));
+                fp = fopen(textFileName, "r");
+                traceDrivenMode = TRUE;
+                continue;
+            }
+        }
+        if (strcmp(argv[i], bucketArg) == 0) {
+            if (argv[i+1][0] != '-') {
+                B = atoi(argv[i+1]);
+                continue;
+            }
+        }
+        if (strcmp(argv[i], rateOfTokensArg) == 0) {
+            if (argv[i+1][0] != '-') {
+                r = strtod(argv[i+1], &rateOfTokensPtr);
+                continue;
+            }
+        }
+        if (strcmp(argv[i], numPacketsArg) == 0) {
+            if (argv[i+1][0] != '-') {
+                n = atoi(argv[i+1]);
+                continue;
+            }
+        }
+        
+        if (strcmp(argv[i], numTokensPerPacketArg) == 0) {
+            if (argv[i+1][0] != '-') {
+                P = atoi(argv[i+1]);
+                continue;
+            }
+        }
+        if (strcmp(argv[i], lambdaArg) == 0) {
+            if (argv[i+1][0] != '-') {
+                lambda = strtod(argv[i+1], &lambdaPtr);
+                continue;
+            }
+        }
+        if (strcmp(argv[i], muArg) == 0) {
+            if (argv[i+1][0] != '-') {
+                mu = strtod(argv[i+1], &muPtr);
+                continue;
+            }
+        }
+        
+    }
+
+    if (traceDrivenMode) {
+        char buf[2000];
+        if (fgets(buf, sizeof(buf), fp) != NULL) {
+            //first line
+            sscanf(buf, "%d", &numPacketsExpected);
+            n = numPacketsExpected;
+        }
+    }
+
+
+    //success
     memset(&q1, 0, sizeof(q1));
     if (!My402ListInit(&q1)) {
-        printf("error: list not initialized\n");
+        fprintf(stderr, "list not initialized\n");
     }
 
     //time of start
-    gettimeofday(&current_time, NULL);
+    gettimeofday(&emulation_start_time, NULL);
     //current_time.tv_sec, current_time.tv_usec
     printf("00000000.000ms: emulation begins\n");
 
@@ -188,6 +280,7 @@ int main(int argc, char *argv[])
     pthread_t tokenThread;
     pthread_t serverThread1;
     pthread_t serverThread2;
+    pthread_t sigIntThread;
 
     int arg1 = 1;
     int arg2 = 2;
@@ -201,6 +294,11 @@ int main(int argc, char *argv[])
     pthread_create(&tokenThread, 0, TokenThread, (void *)argument);
     pthread_create(&serverThread1, 0, ServerThread, (void *)arg1);
     pthread_create(&serverThread2, 0, ServerThread, (void *)arg2);
+    
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    pthread_sigmask(SIG_BLOCK, &set, 0);
+    pthread_create(&sigIntThread, 0, SigIntThread, 0);
 
     pthread_join(packetThread, 0);
     pthread_join(tokenThread, 0);
@@ -211,14 +309,15 @@ int main(int argc, char *argv[])
     struct timeval emulation_finished_time, emulation_finished_time_difference;
     gettimeofday(&emulation_finished_time, NULL);
 
-    TimePassed emulation_finished_time_passed = GetTimePassed2(emulation_finished_time, current_time);
+    TimePassed emulation_finished_time_passed = GetTimePassed2(emulation_finished_time, emulation_start_time);
     printf(
         "%08ld.%03ldms: emulation ends\n", 
         emulation_finished_time_passed.timeSec, 
         emulation_finished_time_passed.timeUsec
     );
-    timersub(&emulation_finished_time, &current_time, &emulation_finished_time_difference);
+    timersub(&emulation_finished_time, &emulation_start_time, &emulation_finished_time_difference);
     totalEmulationTime = emulation_finished_time_difference.tv_sec * 1000 + (double) emulation_finished_time_difference.tv_usec / 1000;
+
 
     PrintStats();
 
@@ -233,9 +332,8 @@ void PrintStats(){
     printf("\n");
     printf("Statistics:\n");
     printf("\n");
-
-    printf("    average packet inter-arrival time = %.5f\n", interArrivalTimeTotal / packets / 1000);
-    printf("    average packet service time = %.5f\n", serviceTimeTotal / packets / 1000);
+    printf("    average packet inter-arrival time = %.5f\n", interArrivalTimeTotal / (packetsTotal) / 1000);
+    printf("    average packet service time = %.5f\n", serviceTimeTotal / (packetsTotal - packetsLost) / 1000);
     printf("\n");
     //divide number into whole number and decimal number
     printf("    average number of packets in Q1 = %.5f\n", q1TimeTotal / (double) totalEmulationTime);
@@ -243,122 +341,279 @@ void PrintStats(){
     printf("    average number of packets at S1 = %.6g\n", s1TimeTotal / totalEmulationTime);
     printf("    average number of packets at S2 = %.6g\n", s2TimeTotal / totalEmulationTime);
     printf("\n");
-    printf("    average time a packet spent in system = %.6g\n", (double) totalPacketTime / 1000000 / (double) packets);
-    //printf("    standard deviation for time spent in system = %.6g\n", 0);
-    printf("    standard deviation for time spent in system = 0\n");
+    printf("    average time a packet spent in system = %.6g\n", (double) totalPacketTime / 1000 / (double) (packetsTotal - packetsLost));
+    //printf("    average system duration squared: %.6g\n", avgSystemDurationSquared);
+    //printf("    average system duration: %.6g\n", avgSystemDuration);
+    printf("    standard deviation for time spent in system = %.6g\n", sqrt((double) (avgSystemDurationSquared) - (double) (avgSystemDuration) * (double) (avgSystemDuration)));
     printf("\n");
-    //printf("token drop probability = %.6g\n", 0);
-    printf("token drop probability = 0\n");
-    //printf("packet drop probability = %.6g\n", 0);
-    printf("packet drop probability = 0\n");
-    /*
-
-    
-
-    */
+    printf("    token drop probability = %.6g\n", (double) ((double) tokensLost / (double) tokensTotal));
+    printf("    packet drop probability = %.6g\n", (double) ((double) packetsLost / (double) packetsTotal));
 }
 
-Packet *NewPacket(int tokensNeeded, double serviceTime, long int createdSec, long int createdMs, long int ogCreatedSec, long int ogCreatedUsec, int id) {
+Packet *NewPacket(int tokensNeeded, double serviceTime, int interArrivalTime, int id, struct timeval enteredTime) {
     Packet *packet = (Packet*)malloc(sizeof(Packet));
     packet -> tokensNeeded = tokensNeeded;
     packet -> serviceTime = serviceTime;
-    packet -> createdSec = createdSec;
-    packet -> createdMs = createdMs;
-    packet -> ogCreatedSec = ogCreatedSec;
-    packet -> ogCreatedUsec = ogCreatedUsec;
+    packet -> interArrivalTime = interArrivalTime;
     packet -> id = id;
+    packet -> creationTime = enteredTime;
     return packet;
+}
+
+void *SigIntThread(void *arg) {
+    int sig;
+    printf("started sig int thread\n");
+    for (;;) {
+        printf("sig waiting\n");
+        sigwait(&set, &sig);
+        printf("sig wait over\n");
+        pthread_mutex_lock(&mutex);
+        printf("SIGINT caught, no new packets or tokens will be allowed\n");
+        //pthread_mutex_unlock(&mutex);
+        //fflush(stdout);
+    }
 }
 
 void *PacketThread(void *arg) {
 
-    usleep(lambda * 1000000);
-    
-    //packet arrival time
-    struct timeval packet_creation_time, time_difference;
-    gettimeofday(&packet_creation_time, NULL);
-    timersub(&packet_creation_time, &current_time, &time_difference);
+    for (;;) {
+        if (packetsSentFromQ1 == n) {
+            return 0;
+        }
+        int interArrivalTime;
+        //int tokens;
+        //int serviceTime;
+        if (traceDrivenMode) {
+            char buf[2000];
+            if (fgets(buf, sizeof(buf), fp) != NULL) {
+                //inter arrival time, number of tokens required, service time
+                if (sscanf(buf, "%d %d %d", &interArrivalTime, &tokensNeeded, &serviceTime) == 3) {
+                    serviceTime = (double) serviceTime;
+                    interArrivalTime *= 1000;
+                } else {
+                    fprintf(stderr, "input not in the right format.\n");
+                    exit(-1);
+                }
+            }
+        } else {
+            tokensNeeded = P;
+            interArrivalTime = 1 / lambda * 1000000;
+            serviceTime = (double) 1/mu * 1000;
+        }
 
-    //format time
-    double time_difference_combined = time_difference.tv_sec * 1000 + (double) time_difference.tv_usec / 1000;
-    long int time_difference_long_int = (long int) time_difference_combined;
-    double time_difference_left_over = time_difference_combined - time_difference_long_int;
-    long int time_difference_left_over_long_int = time_difference_left_over * 1000;
+        usleep(interArrivalTime);
+        
+        pthread_mutex_lock(&mutex);
 
-    //packet creation time
-    double packet_creation_time_combined = packet_creation_time.tv_sec * 1000 + (double) packet_creation_time.tv_usec / 1000;
-    long int packet_creation_time_long_int = (long int) packet_creation_time_combined;
-    double packet_creation_time_left_over = packet_creation_time_combined - packet_creation_time_long_int;
-    long int packet_creation_time_left_over_long_int = packet_creation_time_left_over * 1000;
+        //packet arrival time
+        struct timeval packet_creation_time, inter_arrival_time_measured, total_time;
+        gettimeofday(&packet_creation_time, NULL);
+        if (packetsTotal == 0) {
+            lastPacketArrivedTime = emulation_start_time;
+        }
 
-    packets++;
-    Packet *packet = NewPacket(
-        P, 
-        (double) 1/mu * 1000, 
-        time_difference_long_int, 
-        time_difference_left_over_long_int,
-        packet_creation_time_long_int,
-        packet_creation_time_left_over_long_int,
-        packets
-    );
-    
-    pthread_mutex_lock(&mutex);
+        timersub(&packet_creation_time, &lastPacketArrivedTime, &inter_arrival_time_measured);
+        timersub(&packet_creation_time, &emulation_start_time, &total_time);
 
-    printf(
-        "%08ld.%03ldms: p%d arrives, needs %d tokens, inter-arrival time: %ld.%03ldms\n", 
-        time_difference_long_int, 
-        time_difference_left_over_long_int, 
-        packet -> id, 
-        tokens,
-        time_difference_long_int, 
-        time_difference_left_over_long_int
-    );
-    interArrivalTimeTotal += time_difference_combined;
+        //inter arrival time
+        double inter_arrival_time_measured_combined = inter_arrival_time_measured.tv_sec * 1000 + (double) inter_arrival_time_measured.tv_usec / 1000;
+        long int inter_arrival_time_measured_long_int = (long int) inter_arrival_time_measured_combined;
+        double inter_arrival_time_measured_left_over = inter_arrival_time_measured_combined - inter_arrival_time_measured_long_int;
+        long int inter_arrival_time_measured_left_over_long_int = inter_arrival_time_measured_left_over * 1000;
 
-    if (tokens < P) {
+        //packet creation time
+        double packet_creation_time_combined = packet_creation_time.tv_sec * 1000 + (double) packet_creation_time.tv_usec / 1000;
+        long int packet_creation_time_long_int = (long int) packet_creation_time_combined;
+        double packet_creation_time_left_over = packet_creation_time_combined - packet_creation_time_long_int;
+        long int packet_creation_time_left_over_long_int = packet_creation_time_left_over * 1000;
+
+        //total time
+        double total_time_combined = total_time.tv_sec * 1000 + (double) total_time.tv_usec / 1000;
+        long int total_time_long_int = (long int) total_time_combined;
+        double total_time_left_over = total_time_combined - total_time_long_int;
+        long int total_time_left_over_long_int = total_time_left_over * 1000;
+
+        //if ctrl+c is pressed, do not generate the packet
+        /*
+        *
+        * 
+        * 
+        * 
+        packet generation
+        *
+        * 
+        * 
+        * 
+         */
+        packetsTotal++;
+        Packet *packet = NewPacket(
+            tokensNeeded, 
+            serviceTime, 
+            interArrivalTime,
+            packetsTotal,
+            packet_creation_time
+        );
+
+        lastPacketArrivedTime = packet_creation_time;
+        interArrivalTimeTotal += inter_arrival_time_measured_combined;
+        
+        if (tokensNeeded > B) {
+            printf(
+                "%08ld.%03ldms: p%d arrives, needs %d tokens, inter-arrival time: %ld.%03ldms, dropped\n", 
+                total_time_long_int, 
+                total_time_left_over_long_int, 
+                packet -> id, 
+                tokensNeeded,
+                inter_arrival_time_measured_long_int, 
+                inter_arrival_time_measured_left_over_long_int
+            );
+            packetsLost++;
+            packetsSentFromQ1++;
+            //update number to set the conditionals
+            pthread_mutex_unlock(&mutex);
+            continue;
+        } else if (tokensNeeded > 1) {
+            
+            printf(
+                "%08ld.%03ldms: p%d arrives, needs %d tokens, inter-arrival time: %ld.%03ldms\n", 
+                total_time_long_int, 
+                total_time_left_over_long_int, 
+                packet -> id, 
+                tokensNeeded,
+                inter_arrival_time_measured_long_int, 
+                inter_arrival_time_measured_left_over_long_int
+            );
+        } else {
+            printf(
+                "%08ld.%03ldms: p%d arrives, needs %d token, inter-arrival time: %ld.%03ldms\n", 
+                total_time_long_int, 
+                total_time_left_over_long_int, 
+                packet -> id, 
+                tokensNeeded,
+                inter_arrival_time_measured_long_int, 
+                inter_arrival_time_measured_left_over_long_int
+            );
+        }
+  
+        
+        
         My402ListAppend(&q1, packet);
+        packetsSentFromQ1++;
+        
+
+        //packet arrival time
+        struct timeval q1_entered_time;
+        gettimeofday(&q1_entered_time, NULL);
+        timersub(&q1_entered_time, &emulation_start_time, &total_time);
+        packet -> q1Entered = q1_entered_time;
+
+        //format time
+        total_time_combined = total_time.tv_sec * 1000 + (double) total_time.tv_usec / 1000;
+        total_time_long_int = (long int) total_time_combined;
+        total_time_left_over = total_time_combined - total_time_long_int;
+        total_time_left_over_long_int = total_time_left_over * 1000;
+
+        printf(
+            "%08ld.%03ldms: p%d enters Q1\n", 
+            total_time_long_int, 
+            total_time_left_over_long_int, 
+            packet -> id
+        );
+
+        My402ListElem *first_elem = My402ListFirst(&q1);
+        Packet *first_packet = first_elem -> obj;
+        if (tokensInBucket >= first_packet -> tokensNeeded) {
+            tokensInBucket -= first_packet -> tokensNeeded;
+            My402ListElem *elem = My402ListFirst(&q1);
+            Packet *packet_first = elem -> obj;
+            My402ListElem *new_elem = (My402ListElem*)malloc(sizeof(My402ListElem));
+            new_elem -> obj = &packet_first;
+
+            struct timeval q1_departure_time, q1_duration, total_time;
+            gettimeofday(&q1_departure_time, NULL);
+            timersub(&q1_departure_time, &emulation_start_time, &total_time);
+            timersub(&q1_departure_time, &(packet -> q1Entered), &q1_duration);
+
+            double total_time_combined = total_time.tv_sec * 1000 + (double) total_time.tv_usec / 1000;
+            long int total_time_long_int = (long int)total_time_combined;
+            double total_time_left_over = total_time_combined - total_time_long_int;
+            long int total_time_left_over_long_int = total_time_left_over * 1000;
+
+            //format time
+            double q1_duration_combined = q1_duration.tv_sec * 1000 + (double) q1_duration.tv_usec / 1000;
+            long int q1_duration_long_int = (long int) q1_duration_combined;
+            double q1_duration_left_over = q1_duration_combined - q1_duration_long_int;
+            long int q1_duration_left_over_long_int = q1_duration_left_over * 1000;
+
+            if (tokensInBucket > 1) {
+                printf(
+                    "%08ld.%03ldms: p%d leaves Q1, time in Q1 = %ld.%03ldms, token bucket now has %d tokens\n", 
+                    total_time_long_int, 
+                    total_time_left_over_long_int, 
+                    packet -> id,
+                    q1_duration_long_int,
+                    q1_duration_left_over_long_int,
+                    tokensInBucket
+                );
+            } else {
+                printf(
+                    "%08ld.%03ldms: p%d leaves Q1, time in Q1 = %ld.%03ldms, token bucket now has %d token\n", 
+                    total_time_long_int, 
+                    total_time_left_over_long_int, 
+                    packet -> id,
+                    q1_duration_long_int,
+                    q1_duration_left_over_long_int,
+                    tokensInBucket
+                );
+            }
+
+
+            q1TimeTotal += (double) (q1_duration_long_int + (double) q1_duration_left_over_long_int / 1000);
+
+            My402ListAppend(&q2, packet);
+
+            TimePassed t_enter = GetTimePassed();
+
+            printf(
+                "%08ld.%03ldms: p%d enters Q2\n", 
+                t_enter.timeSec, 
+                t_enter.timeUsec, 
+                packet -> id
+            );
+            packet -> q2EnteredSec = t_enter.timeSec;
+            packet -> q2EnteredUsec = t_enter.timeUsec;
+
+            My402ListUnlink(&q1, My402ListFirst(&q1));
+            packetsSentToQ2++;
+            pthread_cond_broadcast(&cv);
+
+            if (packetsSentToQ2 == (n - packetsLost)) {
+                pthread_mutex_unlock(&mutex);
+                return 0;
+            }
+            
+        }
+
+        pthread_mutex_unlock(&mutex);
     }
-    
-    if (tokens >= P) {
-        My402ListElem *elem = My402ListFirst(&q1);
-        Packet *packet_first = elem -> obj;
-        My402ListElem *new_elem = (My402ListElem*)malloc(sizeof(My402ListElem));
-        new_elem -> obj = &packet_first;
-        My402ListAppend(&q2, new_elem);
-        My402ListUnlink(&q1, My402ListFirst(&q1));
-        pthread_cond_broadcast(&cv);
-        tokens = 0;
-    }
-
-    //packet arrival time
-    gettimeofday(&packet_creation_time, NULL);
-    timersub(&packet_creation_time, &current_time, &time_difference);
-
-    //format time
-    time_difference_combined = time_difference.tv_sec * 1000 + (double) time_difference.tv_usec / 1000;
-    time_difference_long_int = (long int) time_difference_combined;
-    time_difference_left_over = time_difference_combined - time_difference_long_int;
-    time_difference_left_over_long_int = time_difference_left_over * 1000;
-
-    printf(
-        "%08ld.%03ldms: p%d enters Q1\n", 
-        time_difference_long_int, 
-        time_difference_left_over_long_int, 
-        tokens_total
-    );
-
-    pthread_mutex_unlock(&mutex);
 
     return (0);
 
 }
+
 
 //generates tokens at a steady rate
 //when enough token is generated
 //transmit the packet into the server
 void *TokenThread(void *arg) {
     //infinite loop
-    while (tokens_total != P) {
+    for (;;) {
+        if (packetsSentToQ2 == (n - packetsLost)) {
+            pthread_mutex_unlock(&mutex);
+            pthread_cond_broadcast(&cv);
+            return 0;
+        }
+        //keep generating for now
         usleep(1/r * 1000000);
         
         //find out when the token was generated
@@ -369,99 +624,144 @@ void *TokenThread(void *arg) {
         //if ()
         
         pthread_mutex_lock(&mutex);
-        tokens++;
-        tokens_total++;
-        
+
+        //if ctrl+c is pressed, do not generate the token
+        /*
+        *
+        * 
+        * 
+        * 
+        token generation
+        *
+        * 
+        * 
+        * 
+         */
+        tokensTotal++;
+
         //token arrival time
         struct timeval token_creation_time, time_difference;
         gettimeofday(&token_creation_time, NULL);
-        timersub(&token_creation_time, &current_time, &time_difference);
+        timersub(&token_creation_time, &emulation_start_time, &time_difference);
 
         double time_difference_combined = time_difference.tv_sec * 1000 + (double) time_difference.tv_usec / 1000;
         long int time_difference_long_int = (long int) time_difference_combined;
         double time_difference_left_over = time_difference_combined - time_difference_long_int;
         long int time_difference_left_over_long_int = time_difference_left_over * 1000;
 
-        //pluralize "token"
-        if (tokens > 1) {
+        //for the amount in the bucket
+        if (tokensInBucket == B) {
             printf(
-                "%08ld.%03ldms: token t%d arrives, token bucket now has %d tokens\n", 
+                "%08ld.%03ldms: token t%d arrives, dropped\n", 
                 time_difference_long_int, 
                 time_difference_left_over_long_int, 
-                tokens_total, 
-                tokens
+                tokensTotal, 
+                tokensInBucket
             );
+            tokensLost++;
         } else {
-            printf(
-                "%08ld.%03ldms: token t%d arrives, token bucket now has %d token\n", 
-                time_difference_long_int, 
-                time_difference_left_over_long_int, 
-                tokens_total, 
-                tokens
-            );
-        }
+            tokensInBucket++;
 
-        //check if there's enough tokens to remove a packet
-        if (My402ListEmpty(&q1) != TRUE) {
-            My402ListElem *firstElem = My402ListFirst(&q1);
-            if (&firstElem != NULL) {}
-            Packet *packet = firstElem -> obj;
-            if (packet -> tokensNeeded <= tokens) {
-                My402ListUnlink(&q1, firstElem);
-                tokens = 0;
-
-                //packet departure time
-                struct timeval packet_departure_time, time_difference;
-                gettimeofday(&packet_departure_time, NULL);
-                timersub(&packet_departure_time, &current_time, &time_difference);
-
-                //format time
-                time_difference_combined = time_difference.tv_sec * 1000 + (double) time_difference.tv_usec / 1000;
-                time_difference_long_int = (long int) time_difference_combined;
-                time_difference_left_over = time_difference_combined - time_difference_long_int;
-                time_difference_left_over_long_int = time_difference_left_over * 1000;
-
-                //format packet's creation time
-                long int time_difference_packet_long_int = time_difference_long_int - packet -> createdSec;
-                long int time_difference_packet_left_over_long_int = time_difference_left_over_long_int - packet -> createdMs;
-                if (time_difference_packet_left_over_long_int < 0) {
-                    time_difference_packet_long_int--;
-                    time_difference_packet_left_over_long_int = 1000 + time_difference_packet_left_over_long_int;
-                }
-
+            //pluralize "token"
+            if (tokensInBucket > 1) {
                 printf(
-                    "%08ld.%03ldms: p%d leaves Q1, time in Q1 = %ld.%03ldms, token bucket now has %d token\n", 
+                    "%08ld.%03ldms: token t%d arrives, token bucket now has %d tokens\n", 
                     time_difference_long_int, 
                     time_difference_left_over_long_int, 
-                    packet -> id,
-                    time_difference_packet_long_int,
-                    time_difference_packet_left_over_long_int,
-                    tokens
+                    tokensTotal, 
+                    tokensInBucket
                 );
-
-                q1TimeTotal += (double) (time_difference_packet_long_int + (double) time_difference_packet_left_over_long_int / 1000);
-
-                My402ListAppend(&q2, packet);
-
-                TimePassed t_enter = GetTimePassed();
-
-                //00002129.187ms: p1 enters Q2
+            } else {
                 printf(
-                    "%08ld.%03ldms: p%d enters Q2\n", 
-                    t_enter.timeSec, 
-                    t_enter.timeUsec, 
-                    packet -> id
+                    "%08ld.%03ldms: token t%d arrives, token bucket now has %d token\n", 
+                    time_difference_long_int, 
+                    time_difference_left_over_long_int, 
+                    tokensTotal, 
+                    tokensInBucket
                 );
-                packet -> q2EnteredSec = t_enter.timeSec;
-                packet -> q2EnteredUsec = t_enter.timeUsec;
+            }
 
-                //wake up server threads
-                pthread_cond_broadcast(&cv);
+            //check if there's enough tokens to remove a packet
+            if (My402ListEmpty(&q1) != TRUE && packetsSentToQ2 != (n - packetsLost)) {
+                My402ListElem *elem = My402ListFirst(&q1);
+                Packet *packet_first = elem -> obj;
+                if (tokensInBucket >= packet_first -> tokensNeeded) {
+                    My402ListElem *new_elem = (My402ListElem*)malloc(sizeof(My402ListElem));
+                    new_elem -> obj = &packet_first;
+                    tokensInBucket -= packet_first -> tokensNeeded;
+
+                    struct timeval q1_departure_time, q1_duration, total_time;
+                    gettimeofday(&q1_departure_time, NULL);
+                    timersub(&q1_departure_time, &emulation_start_time, &total_time);
+                    timersub(&q1_departure_time, &(packet_first -> q1Entered), &q1_duration);
+
+                    double total_time_combined = total_time.tv_sec * 1000 + (double) total_time.tv_usec / 1000;
+                    long int total_time_long_int = (long int)total_time_combined;
+                    double total_time_left_over = total_time_combined - total_time_long_int;
+                    long int total_time_left_over_long_int = total_time_left_over * 1000;
+
+                    //format time
+                    double q1_duration_combined = q1_duration.tv_sec * 1000 + (double) q1_duration.tv_usec / 1000;
+                    long int q1_duration_long_int = (long int) q1_duration_combined;
+                    double q1_duration_left_over = q1_duration_combined - q1_duration_long_int;
+                    long int q1_duration_left_over_long_int = q1_duration_left_over * 1000;
+
+                    if (tokensInBucket > 1) {
+                        printf(
+                            "%08ld.%03ldms: p%d leaves Q1, time in Q1 = %ld.%03ldms, token bucket now has %d tokens\n", 
+                            total_time_long_int, 
+                            total_time_left_over_long_int, 
+                            packet_first -> id,
+                            q1_duration_long_int,
+                            q1_duration_left_over_long_int,
+                            tokensInBucket
+                        );
+                    } else {
+                        printf(
+                            "%08ld.%03ldms: p%d leaves Q1, time in Q1 = %ld.%03ldms, token bucket now has %d token\n", 
+                            total_time_long_int, 
+                            total_time_left_over_long_int, 
+                            packet_first -> id,
+                            q1_duration_long_int,
+                            q1_duration_left_over_long_int,
+                            tokensInBucket
+                        );
+                    }
 
 
+                    q1TimeTotal += (double) (q1_duration_long_int + (double) q1_duration_left_over_long_int / 1000);
 
+                    My402ListAppend(&q2, packet_first);
+
+                    TimePassed t_enter = GetTimePassed();
+
+                    printf(
+                        "%08ld.%03ldms: p%d enters Q2\n", 
+                        t_enter.timeSec, 
+                        t_enter.timeUsec, 
+                        packet_first -> id
+                    );
+                    packet_first -> q2EnteredSec = t_enter.timeSec;
+                    packet_first -> q2EnteredUsec = t_enter.timeUsec;
+
+                    My402ListUnlink(&q1, My402ListFirst(&q1));
+                    packetsSentToQ2++;
+
+                    //wake up server threads
+                    pthread_cond_broadcast(&cv);
+                    if (packetsSentToQ2 == (n - packetsLost)) {
+                        
+                        pthread_mutex_unlock(&mutex);
+                        return 0;
+                    }
+                }
+            } else if (My402ListEmpty(&q2) && packetsSentToQ2 == (n - packetsLost)) {
+                pthread_mutex_unlock(&mutex);
+                return 0;
             }
         }
+        
+
         pthread_mutex_unlock(&mutex);
 
     }
@@ -482,16 +782,19 @@ void *ServerThread(void *arg) {
         pthread_mutex_lock(&mutex);
         //time_to_quit
         
-        while (My402ListLength(&q2) == 0 && numArrived != numToArrive) {
+        while (My402ListLength(&q2) == 0 && packetsSentToQ2 != (n - packetsLost)) {
+            pthread_mutex_unlock(&mutex);
             pthread_cond_wait(&cv, &mutex);
         }
 
-        if (numArrived == numToArrive && My402ListEmpty(&q1) && My402ListEmpty(&q2)) {
+        if (packetsSentToQ2 == (n - packetsLost) && My402ListEmpty(&q1) && My402ListEmpty(&q2)) {
             //must unlock so the other thread can continue
             pthread_mutex_unlock(&mutex);
             pthread_cond_broadcast(&cv);
             return(0);
         } else {
+
+
             Packet *packet = (Packet*)malloc(sizeof(Packet));
             My402ListElem *elem = My402ListFirst(&q2);
             packet = elem -> obj;
@@ -499,7 +802,6 @@ void *ServerThread(void *arg) {
             My402ListUnlink(&q2, elem);
 
             TimePassed t = GetTimePassed();
-            //00002129.187ms: p1 enters Q2
 
             //format packet's creation time
             long int time_difference_packet_long_int = t.timeSec - packet -> q2EnteredSec;
@@ -518,10 +820,12 @@ void *ServerThread(void *arg) {
                 time_difference_packet_left_over_long_int
             );
             q2TimeTotal += ((double) (time_difference_packet_long_int + (double) time_difference_packet_left_over_long_int / 1000));
+            pthread_mutex_unlock(&mutex);
+            numArrived++;
 
-            struct timeval packet_time, time_difference;
-            gettimeofday(&packet_time, NULL);
-            timersub(&packet_time, &current_time, &time_difference);
+            struct timeval serviceStartTime, time_difference;
+            gettimeofday(&serviceStartTime, NULL);
+            timersub(&serviceStartTime, &emulation_start_time, &time_difference);
 
             //format time
             double time_difference_combined = time_difference.tv_sec * 1000 + (double) time_difference.tv_usec / 1000;
@@ -537,75 +841,92 @@ void *ServerThread(void *arg) {
                 arg,
                 (long int) packet->serviceTime //double
             );
-            
-            
-            //usleep(packet -> serviceTime);
 
-            numArrived++;
-
-            //TimePassed t2 = GetTimePassed();
+            packet -> serviceStartTime = serviceStartTime;
+            
 
             usleep(packet->serviceTime * 1000);
 
-            //packet start time - departure time
-            struct timeval packet_departure_time, packet_service_time;
-            gettimeofday(&packet_departure_time, NULL);
-            timersub(&packet_departure_time, &packet_time, &packet_service_time);
+            //pthread_mutex_lock(&mutex);
+            
 
             //packet departure time
-            struct timeval total_time_difference;
-            timersub(&packet_departure_time, &current_time, &total_time_difference);
+            struct timeval packet_departure_time;
+            gettimeofday(&packet_departure_time, NULL);
 
-            double packet_service_time_combined = packet_service_time.tv_sec * 1000 + (double) packet_service_time.tv_usec / 1000;
-            long int packet_service_time_long_int = (long int) packet_service_time_combined;
-            double packet_service_time_left_over = packet_service_time_combined - packet_service_time_long_int;
-            long int packet_service_time_left_over_long_int = packet_service_time_left_over * 1000;
+            //total time
+            //service duration
+            //system duration
 
-            //time in system
-            double packet_departure_time_combined = packet_departure_time.tv_sec * 1000 + (double) packet_departure_time.tv_usec / 1000;
-            long int packet_departure_time_long_int = (long int) packet_departure_time_combined;
-            double packet_departure_time_left_over = packet_departure_time_combined - packet_departure_time_long_int;
-            long int packet_departure_time_left_over_long_int = packet_departure_time_left_over * 1000;
+            //total time (since the beginning)
+            struct timeval total_time;
+            timersub(&packet_departure_time, &emulation_start_time, &total_time);
+            double total_time_combined = total_time.tv_sec * 1000 + (double) total_time.tv_usec / 1000;
+            long int total_time_long_int = (long int) total_time_combined;
+            double total_time_left_over = total_time_combined - total_time_long_int;
+            long int total_time_left_over_long_int = total_time_left_over * 1000;
 
-            double total_time_difference_combined = total_time_difference.tv_sec * 1000 + (double) total_time_difference.tv_usec / 1000;
-            long int total_time_difference_long_int = (long int) total_time_difference_combined;
-            double total_time_difference_left_over = total_time_difference_combined - total_time_difference_long_int;
-            long int total_time_difference_left_over_long_int = total_time_difference_left_over * 1000;
+            //service duration
+            struct timeval packet_service_duration;
+            timersub(&packet_departure_time, &(packet -> serviceStartTime), &packet_service_duration);
+            double packet_service_duration_combined = packet_service_duration.tv_sec * 1000 + (double) packet_service_duration.tv_usec / 1000;
+            long int packet_service_duration_long_int = (long int) packet_service_duration_combined;
+            double packet_service_duration_left_over = packet_service_duration_combined - packet_service_duration_long_int;
+            long int packet_service_duration_left_over_long_int = packet_service_duration_left_over * 1000;
 
-            long int system_time_long_int = packet_departure_time_long_int - packet -> ogCreatedSec;
-            long int system_time_left_over_long_int = packet_departure_time_left_over_long_int - packet -> ogCreatedUsec;
-            if (system_time_left_over_long_int < 0) {
-                system_time_long_int--;
-                system_time_left_over_long_int = 1000 + system_time_left_over_long_int;
-            }
+            //system duration
+            struct timeval system_duration;
+            timersub(&packet_departure_time, &(packet -> creationTime), &system_duration);
+            double system_duration_combined = system_duration.tv_sec * 1000 + (double) system_duration.tv_usec / 1000;
+            long int system_duration_long_int = (long int) system_duration_combined;
+            double system_duration_left_over = system_duration_combined - system_duration_long_int;
+            long int system_duration_left_over_long_int = system_duration_left_over * 1000;
 
 
-            totalPacketTime += (double) system_time_long_int * 1000 + (double) system_time_left_over_long_int / 1000;
-            printf("total packet time in server: %f\n", totalPacketTime);
+            //if ctrl+c is pressed, do not transmit the packet
+            /*
+            *
+            * 
+            * 
+            * 
+            server processing packet
+            *
+            * 
+            * 
+            * 
+            */
+
+            totalPacketTime += system_duration_combined;
 
             printf(
                 "%08ld.%03ldms: p%d departs from S%d, service time = %ld.%03ldms, time in system = %ld.%03ldms\n", 
-                total_time_difference_long_int, 
-                total_time_difference_left_over_long_int, 
+                total_time_long_int, 
+                total_time_left_over_long_int, 
                 packet -> id,
                 arg,
-                packet_service_time_long_int,
-                packet_service_time_left_over_long_int,
-                system_time_long_int,
-                system_time_left_over_long_int
+                packet_service_duration_long_int,
+                packet_service_duration_left_over_long_int,
+                system_duration_long_int,
+                system_duration_left_over_long_int
             );
             //total service time
-            serviceTimeTotal += packet_service_time_combined;
-            //service time by thread
-            if (arg == 1) {
-                s1TimeTotal += (double) packet_service_time_combined;
-                printf("s1 time total in server thread: %f\n", s1TimeTotal);
-            } else {
-                s2TimeTotal += (double) packet_service_time_combined;
-            }
+            serviceTimeTotal += packet_service_duration_combined;
             
 
-            pthread_mutex_unlock(&mutex);
+            //running average of system duration
+            avgSystemDuration = ((packetsProcessedByServers * avgSystemDuration + system_duration_combined / 1000)) / (packetsProcessedByServers + 1);
+            //running average of system duration squared
+            avgSystemDurationSquared = ((packetsProcessedByServers * avgSystemDurationSquared + ((system_duration_combined / 1000) * (system_duration_combined / 1000))) / (packetsProcessedByServers + 1));
+            packetsProcessedByServers++;
+
+            //service time by thread
+            if (arg == 1) {
+                s1TimeTotal += (double) packet_service_duration_combined;
+            } else {
+                s2TimeTotal += (double) packet_service_duration_combined;
+            }
+            
+            //pthread_mutex_unlock(&mutex);
         }
     }
     return (0);
